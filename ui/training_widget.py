@@ -1,14 +1,18 @@
 import os
 import shutil
+from pathlib import Path
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog,
     QListWidget, QListWidgetItem, QLineEdit, QLabel, QMessageBox,
-    QDoubleSpinBox, QSpinBox, QComboBox, QFormLayout, QGroupBox, QCheckBox
+    QDoubleSpinBox, QSpinBox, QComboBox, QFormLayout, QGroupBox, QCheckBox,
+    QInputDialog, QApplication
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
+import cv2
 from core.models import MasterTemplate, ComponentAnnotation, CodeRegionAnnotation
-from core.template_manager import MasterTemplateManager
+from core.template_manager import MasterTemplateManager, sanitize_template_name
 from core.app_settings import AppSettings
+from core.image_utils import read_image, write_image
 from training.golden_image_builder import GoldenImageBuilder
 from training.annotation_canvas import AnnotationCanvas
 
@@ -21,10 +25,16 @@ class TrainingModuleWidget(QWidget):
     selected, to keep the screen uncluttered.
     """
 
-    def __init__(self, settings: AppSettings, parent=None):
+    # Emitted with the template name after a Master Template is saved, so
+    # the inspection side can switch to it instead of a stale engine.
+    templateSaved = Signal(str)
+
+    WORKING_GOLDEN_NAME = "_working_golden_image.png"  # PNG: lossless, no JPEG artefacts in the baseline
+
+    def __init__(self, settings: AppSettings, template_manager: MasterTemplateManager | None = None, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.template_manager = MasterTemplateManager()
+        self.template_manager = template_manager or MasterTemplateManager()
         self.current_template: MasterTemplate | None = None
         self.reference_paths: list[str] = []
         self._selected_component_id: str | None = None
@@ -48,10 +58,12 @@ class TrainingModuleWidget(QWidget):
         add_images_btn = QPushButton("Add Image(s)")
         clear_images_btn = QPushButton("Clear Images")
         build_btn = QPushButton("Build Golden Image")
+        load_template_btn = QPushButton("Load Existing Template...")
         save_btn = QPushButton("Save Master Template")
         add_images_btn.clicked.connect(self._add_references)
         clear_images_btn.clicked.connect(self._clear_references)
         build_btn.clicked.connect(self._build_golden_image)
+        load_template_btn.clicked.connect(self._choose_template_to_load)
         save_btn.clicked.connect(self._save_template)
 
         image_form = QFormLayout()
@@ -67,6 +79,7 @@ class TrainingModuleWidget(QWidget):
         golden_layout.addWidget(self.image_count_label)
         golden_layout.addLayout(images_row)
         golden_layout.addWidget(build_btn)
+        golden_layout.addWidget(load_template_btn)
         golden_layout.addLayout(image_form)
 
         # ---- Draw settings ----
@@ -206,10 +219,15 @@ class TrainingModuleWidget(QWidget):
     # ---- golden image: build from references ----
     def _add_references(self):
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select PCB Reference Image(s)", "", "Images (*.png *.jpg *.bmp)"
+            self, "Select PCB Reference Image(s)", "", "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)"
         )
         if paths:
-            self.reference_paths.extend(paths)
+            # Ignore images that were already added (same file picked twice).
+            known = {os.path.abspath(p) for p in self.reference_paths}
+            for p in paths:
+                if os.path.abspath(p) not in known:
+                    self.reference_paths.append(p)
+                    known.add(os.path.abspath(p))
             self.image_count_label.setText(f"Reference images loaded: {len(self.reference_paths)}")
 
     def _clear_references(self):
@@ -221,25 +239,50 @@ class TrainingModuleWidget(QWidget):
             QMessageBox.warning(self, "No Images", "Add at least one reference image first.")
             return
 
-        builder = GoldenImageBuilder(self.reference_paths)
-        os.makedirs(self.settings.golden_image_dir, exist_ok=True)
-        working_path = os.path.join(self.settings.golden_image_dir, "_working_golden_image.jpg")
-        builder.save(working_path)
+        try:
+            builder = GoldenImageBuilder(self.reference_paths)
+            os.makedirs(self.settings.golden_image_dir, exist_ok=True)
+            working_path = os.path.join(self.settings.golden_image_dir, self.WORKING_GOLDEN_NAME)
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                builder.save(working_path)
+            finally:
+                QApplication.restoreOverrideCursor()
+        except (IOError, OSError, ValueError, cv2.error) as exc:
+            QMessageBox.critical(self, "Golden Image Failed", f"Could not build the Golden Image:\n{exc}")
+            return
 
         if len(self.reference_paths) < GoldenImageBuilder.RECOMMENDED_MIN_IMAGES:
             QMessageBox.information(
                 self, "Golden Image Created",
                 f"Golden Image created from {len(self.reference_paths)} image(s).\n"
-                f"For best accuracy, shergillkuldeep@outlook.com recommends at least "
-                f"{GoldenImageBuilder.RECOMMENDED_MIN_IMAGES} reference images."
+                f"For best accuracy, at least {GoldenImageBuilder.RECOMMENDED_MIN_IMAGES} "
+                f"reference images are recommended."
             )
 
+        self._start_new_template(working_path)
+
+    # ---- golden image: uploaded from Output Image Path tab ----
+    def load_uploaded_golden_image(self, image_path: str) -> bool:
+        ok = self._start_new_template(image_path)
+        if ok:
+            QMessageBox.information(self, "Golden Image Loaded",
+                                    f"'{os.path.basename(image_path)}' loaded into the Training tab.")
+        return ok
+
+    def _start_new_template(self, golden_path: str) -> bool:
+        if not self.canvas.load_image(golden_path):
+            QMessageBox.critical(self, "Invalid Image", f"Could not open image:\n{golden_path}")
+            return False
         name = self.template_name_edit.text().strip() or "UnnamedTemplate"
         self.current_template = MasterTemplate(
-            template_name=name, golden_image_path=working_path,
+            template_name=name, golden_image_path=golden_path,
             module_similarity_threshold=self.module_threshold_spin.value(),
         )
-        self.canvas.load_image(working_path)
+        self._reset_selection_and_lists()
+        return True
+
+    def _reset_selection_and_lists(self):
         self._selected_component_id = None
         self._selected_region_id = None
         self._close_component_editor()
@@ -247,25 +290,50 @@ class TrainingModuleWidget(QWidget):
         self._refresh_component_list()
         self._refresh_code_region_list()
 
-    # ---- golden image: uploaded from Output Image Path tab ----
-    def load_uploaded_golden_image(self, image_path: str):
-        name = self.template_name_edit.text().strip() or "UnnamedTemplate"
-        self.current_template = MasterTemplate(
-            template_name=name, golden_image_path=image_path,
-            module_similarity_threshold=self.module_threshold_spin.value(),
-        )
-        self.canvas.load_image(image_path)
-        self._selected_component_id = None
-        self._selected_region_id = None
-        self._close_component_editor()
-        self._close_region_editor()
-        self._refresh_component_list()
-        self._refresh_code_region_list()
+    # ---- load a saved template for editing ----
+    def _choose_template_to_load(self):
+        names = self.template_manager.list_templates()
+        if not names:
+            QMessageBox.information(self, "No Templates", "No saved Master Templates were found.")
+            return
+        name, ok = QInputDialog.getItem(self, "Load Master Template", "Template:", names, 0, False)
+        if ok and name:
+            self.load_template(name)
+
+    def load_template(self, name: str) -> bool:
+        try:
+            template = self.template_manager.load(name)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            QMessageBox.critical(self, "Load Failed", f"Could not load template '{name}':\n{exc}")
+            return False
+        if not self.canvas.load_image(template.golden_image_path):
+            QMessageBox.critical(self, "Load Failed",
+                                 f"Golden Image for '{name}' is missing:\n{template.golden_image_path}")
+            return False
+        self.current_template = template
+        self.template_name_edit.setText(template.template_name)
+        self.module_threshold_spin.setValue(template.module_similarity_threshold)
+        for c in template.components:
+            self.canvas.add_component_item(c.component_id, c.x, c.y, c.w, c.h, c.name,
+                                           c.shape, c.line_width, c.font_size)
+        for r in template.code_regions:
+            self.canvas.add_code_region_item(r.region_id, r.x, r.y, r.w, r.h, r.code_type,
+                                             r.shape, r.line_width)
+        self._reset_selection_and_lists()
+        return True
 
     # ---- components ----
     def _on_component_added(self, data: dict):
         if not self.current_template:
+            self.canvas.remove_item(data["component_id"])
             QMessageBox.warning(self, "No Template", "Build or upload a Golden Image first.")
+            return
+        if self.current_template.has_component_named(data["name"]):
+            # Names must be unique: they identify components in results and logs.
+            self.canvas.remove_item(data["component_id"])
+            QMessageBox.warning(self, "Duplicate Name",
+                                f"A component named '{data['name']}' already exists. Please draw it again "
+                                f"with a different name.")
             return
         self.current_template.add_component(ComponentAnnotation(**data))
         self._refresh_component_list()
@@ -316,7 +384,11 @@ class TrainingModuleWidget(QWidget):
         comp = self._find_component(self._selected_component_id)
         if not comp:
             return
-        comp.name = self.edit_name_edit.text().strip() or comp.name
+        new_name = self.edit_name_edit.text().strip() or comp.name
+        if new_name != comp.name and self.current_template.has_component_named(new_name):
+            QMessageBox.warning(self, "Duplicate Name", f"A component named '{new_name}' already exists.")
+            return
+        comp.name = new_name
         comp.similarity_threshold = self.edit_threshold_spin.value()
         comp.x = self.edit_x_spin.value(); comp.y = self.edit_y_spin.value()
         comp.w = self.edit_w_spin.value(); comp.h = self.edit_h_spin.value()
@@ -333,7 +405,7 @@ class TrainingModuleWidget(QWidget):
         self.current_template.components = [
             c for c in self.current_template.components if c.component_id != self._selected_component_id
         ]
-        self.canvas.remove_component_item(self._selected_component_id)
+        self.canvas.remove_item(self._selected_component_id)
         self._close_component_editor()
         self._refresh_component_list()
 
@@ -352,6 +424,7 @@ class TrainingModuleWidget(QWidget):
     # ---- code regions ----
     def _on_code_region_added(self, data: dict):
         if not self.current_template:
+            self.canvas.remove_item(data["region_id"])
             QMessageBox.warning(self, "No Template", "Build or upload a Golden Image first.")
             return
         self.current_template.add_code_region(CodeRegionAnnotation(**data))
@@ -410,7 +483,7 @@ class TrainingModuleWidget(QWidget):
         self.current_template.code_regions = [
             r for r in self.current_template.code_regions if r.region_id != self._selected_region_id
         ]
-        self.canvas.remove_component_item(self._selected_region_id)
+        self.canvas.remove_item(self._selected_region_id)
         self._close_region_editor()
         self._refresh_code_region_list()
 
@@ -442,22 +515,53 @@ class TrainingModuleWidget(QWidget):
             QMessageBox.warning(self, "Incomplete", "Add at least one component before saving.")
             return
 
-        template_name = self.template_name_edit.text().strip() or "UnnamedTemplate"
+        template_name = sanitize_template_name(self.template_name_edit.text())
+        self.template_name_edit.setText(template_name)
         self.current_template.template_name = template_name
         self.current_template.module_similarity_threshold = self.module_threshold_spin.value()
 
+        if self.template_manager.path_for(template_name).exists():
+            answer = QMessageBox.question(
+                self, "Overwrite Template?",
+                f"A Master Template named '{template_name}' already exists. Overwrite it?"
+            )
+            if answer != QMessageBox.Yes:
+                return
+
         os.makedirs(self.settings.golden_image_dir, exist_ok=True)
-        default_path = os.path.join(self.settings.golden_image_dir, f"{template_name}.jpg")
+        default_path = os.path.join(self.settings.golden_image_dir, f"{template_name}.png")
         golden_save_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Golden Image As", default_path, "JPEG Image (*.jpg)"
+            self, "Save Golden Image As", default_path,
+            "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg);;Bitmap (*.bmp)"
         )
         if not golden_save_path:
             QMessageBox.information(self, "Cancelled", "Master Template was not saved (no Golden Image location chosen).")
             return
+        if not Path(golden_save_path).suffix:
+            golden_save_path += ".png"
 
-        if os.path.abspath(golden_save_path) != os.path.abspath(self.current_template.golden_image_path):
-            shutil.copyfile(self.current_template.golden_image_path, golden_save_path)
-        self.current_template.golden_image_path = golden_save_path
-
-        path = self.template_manager.save(self.current_template)
+        try:
+            self._store_golden_image(self.current_template.golden_image_path, golden_save_path)
+            self.current_template.golden_image_path = golden_save_path
+            path = self.template_manager.save(self.current_template)
+        except (IOError, OSError) as exc:
+            QMessageBox.critical(self, "Save Failed", f"Could not save the Master Template:\n{exc}")
+            return
         QMessageBox.information(self, "Saved", f"Master Template saved to {path}\nGolden Image saved to {golden_save_path}")
+        self.templateSaved.emit(self.current_template.template_name)
+
+    @staticmethod
+    def _store_golden_image(src: str, dst: str) -> None:
+        """Copies the golden image to its chosen location. If the file type
+        changes (e.g. working PNG saved as .jpg), the image is re-encoded
+        instead of byte-copied, so the extension always matches the content."""
+        if os.path.abspath(src) == os.path.abspath(dst):
+            return
+        os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+        if Path(src).suffix.lower() == Path(dst).suffix.lower():
+            shutil.copyfile(src, dst)
+            return
+        image = read_image(src, cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise IOError(f"Cannot read golden image {src}")
+        write_image(dst, image)

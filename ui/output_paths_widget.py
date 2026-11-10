@@ -1,4 +1,5 @@
 import os
+import sys
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QLineEdit, QPushButton, QGroupBox,
     QFileDialog, QHBoxLayout, QMessageBox, QLabel
@@ -110,6 +111,12 @@ class OutputPathsWidget(QWidget):
         if not pass_dir or not fail_dir:
             QMessageBox.warning(self, "Invalid Paths", "Both Pass and Fail folder paths are required.")
             return
+        try:
+            os.makedirs(pass_dir, exist_ok=True)
+            os.makedirs(fail_dir, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.critical(self, "Invalid Paths", f"Could not create the folders:\n{exc}")
+            return
         self.settings.pass_dir = pass_dir
         self.settings.fail_dir = fail_dir
         self.outputPathsChanged.emit(pass_dir, fail_dir)
@@ -120,32 +127,39 @@ class OutputPathsWidget(QWidget):
         if not golden_dir:
             QMessageBox.warning(self, "Invalid Path", "Golden Image folder is required.")
             return
-        os.makedirs(golden_dir, exist_ok=True)
+        try:
+            os.makedirs(golden_dir, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.critical(self, "Invalid Path", f"Could not create the folder:\n{exc}")
+            return
         self.settings.golden_image_dir = golden_dir
         QMessageBox.information(self, "Golden Image Folder Updated", f"New Golden Images will default to: {golden_dir}")
 
     def _upload_golden_image(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Existing Golden Image", self.settings.golden_image_dir, "Images (*.png *.jpg *.bmp)"
+            self, "Select Existing Golden Image", self.settings.golden_image_dir,
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)"
         )
         if path:
             self.goldenImageUploaded.emit(path)
-            QMessageBox.information(self, "Golden Image Loaded", f"'{os.path.basename(path)}' loaded into the Training tab.")
 
     def _apply_logging_path(self):
         log_dir = self.log_dir_edit.text().strip()
         if not log_dir:
             QMessageBox.warning(self, "Invalid Path", "Logging folder is required.")
             return
-        os.makedirs(log_dir, exist_ok=True)
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.critical(self, "Invalid Path", f"Could not create the folder:\n{exc}")
+            return
         self.settings.logging_dir = log_dir
         self.loggingPathChanged.emit(log_dir)
         QMessageBox.information(self, "Logging Path Updated", f"Inspection logs will be saved to: {log_dir}")
 
     def _browse_tesseract_exe(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select tesseract Executable", "", "Executable (*.exe);;All Files (*)"
-        )
+        file_filter = "Executable (*.exe);;All Files (*)" if sys.platform == "win32" else "All Files (*)"
+        path, _ = QFileDialog.getOpenFileName(self, "Select tesseract Executable", "", file_filter)
         if path:
             self.tesseract_path_edit.setText(path)
 

@@ -1,0 +1,8 @@
+# Test dependencies (core app deps without the heavy EasyOCR/PyTorch stack).
+PySide6>=6.6.0
+opencv-contrib-python>=4.9.0
+numpy>=1.26.0
+pyzbar>=0.1.9
+pytesseract>=0.3.10
+pytest>=8.0
+pytest-qt>=4.4

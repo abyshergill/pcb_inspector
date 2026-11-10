@@ -24,6 +24,11 @@ PCB_Inspector/
 ├── main.py                        
 ├── config.py                      
 ├── requirements.txt
+├── requirements-dev.txt           # test dependencies
+├── run.sh / run_mac.command       # Linux / macOS launcher
+├── run.bat / run.ps1              # Windows launcher
+├── run_tests.sh / run_tests.bat   # test runners
+├── tests/                         # pytest suite
 ├── assets/
 │   ├── icon.png                   
 │   └── splash.png                 
@@ -169,6 +174,11 @@ All default paths and constants live in `config.py`:
 | `TESSERACT_PATH` | Optional path to `tesseract.exe`; blank triggers automatic EasyOCR fallback |
 | `ICON_PATH` / `SPLASH_PATH` | Branding assets shown at startup |
 | `LIVE_PREVIEW_INTERVAL_MS` | Refresh rate for the Live Capture preview feed |
+| `TEMPLATES_DIR` | Folder where Master Template JSON files are stored |
+| `MAX_PENDING_LIVE_INSPECTIONS` | Live triggers are skipped while this many inspections are still queued |
+| `NETWORK_CONNECT_TIMEOUT_S` | TCP connect timeout for Mode 1 |
+
+All default folders are resolved relative to the project folder, so the app behaves the same whichever directory it is started from.
 
 All of the above (except splash/icon) can also be changed at runtime from the **Output Image Path** tab without editing code, and are held in a shared `AppSettings` object referenced by every tab that needs them.
 
@@ -188,6 +198,8 @@ pytesseract>=0.3.10
 easyocr>=1.7.0
 ```
 
+Python 3.10 or newer is required. Install only **one** OpenCV wheel (`opencv-contrib-python`). `opencv-python`, `opencv-python-headless` and `opencv-contrib-python` all provide the same `cv2` module and overwrite each other.
+
 **Notes:**
 * `opencv-contrib-python` from pip is CPU-only. For true CUDA acceleration, build OpenCV from source with `-D WITH_CUDA=ON`. The engine automatically falls back to CPU if CUDA is unavailable.
 * `pyzbar` requires the native `zbar` shared library on the OS (e.g. Visual C++ Redistributable 2013 x64 on Windows, or `libzbar0` on Linux).
@@ -196,19 +208,44 @@ easyocr>=1.7.0
 
 ## Running the Application
 
+### With the launcher scripts (recommended)
+
+The scripts create a `.venv` virtual environment on first run, install the dependencies (again only when `requirements.txt` changes), then start the app.
+
+| Platform | Start the app | Run the tests |
+|---|---|---|
+| Windows | double-click `run.bat`, or `run.bat` / `.\run.ps1` in a terminal | `run_tests.bat` |
+| Linux | `./run.sh` | `./run_tests.sh` |
+| macOS | `./run.sh`, or double-click `run_mac.command` in Finder | `./run_tests.sh` |
+
+Options (all scripts): `--test` runs the test suite, `--skip-install` skips the dependency check, and `--no-easyocr` skips the large optional EasyOCR/PyTorch download. Set `PYTHON` to choose a specific interpreter (e.g. `PYTHON=python3.12 ./run.sh`).
+
+On macOS install the barcode library with `brew install zbar`; on Linux use `sudo apt install libzbar0`. QR codes are still read without it, through OpenCV.
+
+### Manually
+
 ```bash
 python main.py
 ```
 
 This shows the splash screen, then opens the main window with five tabs: Training / Master Registration, Live Inspection, Live Capture, Output Image Path, and Hardware Sync.
 
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+QT_QPA_PLATFORM=offscreen python -m pytest tests
+```
+
+The suite under `tests/` covers image normalization, template persistence, file naming, the inspection engine, the golden image builder, CSV logging, TCP/UDP triggering over loopback, and smoke tests of the Qt widgets. It needs no camera, network hardware or display.
+
 ## Typical Workflow
 
 1. **Output Image Path tab** — set Pass/Fail folders, Golden Image folder, logging folder, and optionally a Tesseract path (or leave blank for EasyOCR).
-2. **Training tab** — build a Golden Image from 5+ reference photos (or upload an existing one), draw Components with names and thresholds, optionally mark Code Regions for QR/Barcode/OCR, then save the Master Template (choosing where the Golden Image itself is stored).
+2. **Training tab** — build a Golden Image from 5+ reference photos (or upload an existing one, or use **Load Existing Template...** to edit a saved one), draw Components with names and thresholds, optionally mark Code Regions for QR/Barcode/OCR, then save the Master Template (choosing where the Golden Image itself is stored).
 3. **Hardware Sync tab** — configure Mode 1 or Mode 2 for live production, or use Batch Testing to validate the template offline first. Use the built-in instructions and test-signal buttons to confirm connectivity.
 4. **Live Capture tab** — use Live Preview to frame the PCB, then Manual Capture or Auto Capture as needed.
-5. **Live Inspection tab** — review Color/Algorithm views with pass/fail overlays and decoded Code Region values; start logging to record results to CSV.
+5. **Live Inspection tab** — choose the **Active Template** (the template you saved most recently is selected automatically), review Color/Algorithm views with pass/fail overlays and decoded Code Region values; start logging to record results to CSV.
 
 ## Troubleshooting Notes
 

@@ -1,6 +1,14 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, asdict
 from typing import List
 import uuid
+
+
+def _known_fields(cls, d: dict) -> dict:
+    """Drops keys a dataclass doesn't know about, so templates saved by a
+    newer/older version of the app still load instead of raising TypeError."""
+    names = {f.name for f in fields(cls)}
+    return {k: v for k, v in d.items() if k in names}
+
 
 @dataclass
 class ComponentAnnotation:
@@ -17,11 +25,12 @@ class ComponentAnnotation:
     font_size: int = 10
 
     def to_dict(self) -> dict:
-        return self.__dict__.copy()
+        return asdict(self)
 
     @staticmethod
     def from_dict(d: dict) -> "ComponentAnnotation":
-        return ComponentAnnotation(**d)
+        return ComponentAnnotation(**_known_fields(ComponentAnnotation, d))
+
 
 @dataclass
 class CodeRegionAnnotation:
@@ -43,11 +52,12 @@ class CodeRegionAnnotation:
     enabled: bool = True
 
     def to_dict(self) -> dict:
-        return self.__dict__.copy()
+        return asdict(self)
 
     @staticmethod
     def from_dict(d: dict) -> "CodeRegionAnnotation":
-        return CodeRegionAnnotation(**d)
+        return CodeRegionAnnotation(**_known_fields(CodeRegionAnnotation, d))
+
 
 @dataclass
 class MasterTemplate:
@@ -63,6 +73,9 @@ class MasterTemplate:
 
     def add_code_region(self, region: CodeRegionAnnotation) -> None:
         self.code_regions.append(region)
+
+    def has_component_named(self, name: str) -> bool:
+        return any(c.name == name for c in self.components)
 
     def to_dict(self) -> dict:
         return {

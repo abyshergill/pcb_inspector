@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsEllipseItem,
     QGraphicsSimpleTextItem, QGraphicsItem, QInputDialog, QLineEdit
 )
-from PySide6.QtGui import QPixmap, QPen, QBrush, QColor, QFont
+from PySide6.QtGui import QPixmap, QPen, QBrush, QColor, QFont, QPainterPath
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal
 
 COMPONENT_COLOR = "#00C853"   # green
@@ -58,6 +58,16 @@ class ResizableShapeItem:
         pad = self.HANDLE_SIZE
         return base.adjusted(-pad, -pad, pad, pad)
 
+    def shape(self):
+        # The corner handles of an ellipse lie outside the ellipse itself, so
+        # without this they could never be clicked and circles could not be
+        # resized. Include them in the hit area while in Edit mode.
+        path = QPainterPath(super().shape())
+        if self._resizable_enabled():
+            for rect in self._handle_rects().values():
+                path.addRect(rect)
+        return path
+
     def paint(self, painter, option, widget=None):
         super().paint(painter, option, widget)
         if self._resizable_enabled():
@@ -90,6 +100,7 @@ class ResizableShapeItem:
                 new_rect = QRectF(r.topLeft(), pos)
             new_rect = new_rect.normalized()
             if new_rect.width() > 10 and new_rect.height() > 10:
+                self.prepareGeometryChange()
                 self.setRect(new_rect)
                 self._update_label_pos()
             event.accept()
@@ -139,6 +150,7 @@ class AnnotationCanvas(QGraphicsView):
         self._pixmap_item = None
         self._start_point = None
         self._rubber_band_item = None
+        self._edit_target = None
 
         self.mode = "draw"              # "draw" or "edit"
         self.drawing_mode = "rect"      # "rect" or "circle"
@@ -153,8 +165,16 @@ class AnnotationCanvas(QGraphicsView):
         self.mode = mode
         is_edit = (mode == "edit")
         for item in self._items_by_id.values():
-            item.setFlag(QGraphicsItem.ItemIsMovable, is_edit)
-            item.setFlag(QGraphicsItem.ItemIsSelectable, is_edit)
+            self._apply_mode_flags(item)
+            item.update()  # repaint so resize handles appear/disappear immediately
+
+    def _apply_mode_flags(self, item) -> None:
+        is_edit = (self.mode == "edit")
+        item.prepareGeometryChange()
+        item.setFlag(QGraphicsItem.ItemIsMovable, is_edit)
+        item.setFlag(QGraphicsItem.ItemIsSelectable, is_edit)
+        if not is_edit:
+            item.setSelected(False)
 
     def set_drawing_mode(self, mode: str) -> None:
         self.drawing_mode = mode
@@ -168,13 +188,62 @@ class AnnotationCanvas(QGraphicsView):
     def set_font_size(self, size: int) -> None:
         self.font_size = size
 
-    def load_image(self, image_path: str) -> None:
+    def load_image(self, image_path: str) -> bool:
+        """Loads a new background image and clears all shapes. Returns False
+        if the image could not be read."""
         self._scene.clear()
         self._items_by_id.clear()
+        self._rubber_band_item = None
+        self._edit_target = None
         pixmap = QPixmap(image_path)
+        if pixmap.isNull():
+            self._pixmap_item = None
+            return False
         self._pixmap_item = self._scene.addPixmap(pixmap)
-        self._scene.setSceneRect(pixmap.rect())
+        self._scene.setSceneRect(QRectF(pixmap.rect()))
         self.fitInView(self._pixmap_item, Qt.KeepAspectRatio)
+        return True
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._pixmap_item is not None:
+            self.fitInView(self._pixmap_item, Qt.KeepAspectRatio)
+
+    def _image_rect(self) -> QRectF:
+        return self._pixmap_item.boundingRect() if self._pixmap_item is not None else QRectF()
+
+    def _clamp_to_image(self, rect: QRectF) -> QRectF:
+        """Keeps drawn shapes inside the image, so their saved coordinates
+        are never negative or beyond the image edge."""
+        if self._pixmap_item is None:
+            return rect
+        return rect.intersected(self._image_rect())
+
+    # ---- creating shape items (also used to show a loaded template) ----
+    def add_component_item(self, comp_id: str, x: int, y: int, w: int, h: int, name: str,
+                           shape: str = "rect", line_width: int = 2, font_size: int = 10):
+        cls = LabeledEllipseItem if shape == "circle" else LabeledRectItem
+        item = cls(QRectF(x, y, w, h), name, line_width, font_size, COMPONENT_COLOR)
+        item.setData(0, comp_id)
+        item.setData(1, "component")
+        self._scene.addItem(item)
+        self._items_by_id[comp_id] = item
+        self._apply_mode_flags(item)
+        return item
+
+    def add_code_region_item(self, region_id: str, x: int, y: int, w: int, h: int, code_type: str,
+                             shape: str = "rect", line_width: int = 2):
+        cls = LabeledEllipseItem if shape == "circle" else LabeledRectItem
+        item = cls(QRectF(x, y, w, h), f"CODE:{code_type}", line_width, 10, CODE_REGION_COLOR)
+        item.setData(0, region_id)
+        item.setData(1, "code_region")
+        self._scene.addItem(item)
+        self._items_by_id[region_id] = item
+        self._apply_mode_flags(item)
+        return item
+
+    def has_item(self, item_id: str) -> bool:
+        return item_id in self._items_by_id
 
     # ---- edit-mode helpers (called by the host widget) ----
     def update_component_item(self, comp_id: str, x: int, y: int, w: int, h: int,
@@ -182,6 +251,7 @@ class AnnotationCanvas(QGraphicsView):
         item = self._items_by_id.get(comp_id)
         if item is None:
             return
+        item.prepareGeometryChange()
         item.setPos(0, 0)
         item.setRect(QRectF(x, y, w, h))
         item.setPen(QPen(QColor(COMPONENT_COLOR), line_width))
@@ -195,16 +265,22 @@ class AnnotationCanvas(QGraphicsView):
         item = self._items_by_id.get(region_id)
         if item is None:
             return
+        item.prepareGeometryChange()
         item.setPos(0, 0)
         item.setRect(QRectF(x, y, w, h))
         item.setPen(QPen(QColor(CODE_REGION_COLOR), line_width))
         item.label.setText(f"CODE:{code_type}")
         item._update_label_pos()
 
-    def remove_component_item(self, item_id: str) -> None:
+    def remove_item(self, item_id: str) -> None:
         item = self._items_by_id.pop(item_id, None)
         if item is not None:
+            if self._edit_target is item:
+                self._edit_target = None
             self._scene.removeItem(item)
+
+    # Old name kept for compatibility (it removes code regions too).
+    remove_component_item = remove_item
 
     def _resolve_labeled_item(self, item):
         while item is not None and not isinstance(item, (LabeledRectItem, LabeledEllipseItem)):
@@ -214,6 +290,10 @@ class AnnotationCanvas(QGraphicsView):
     # ---- mouse handling ----
     def mousePressEvent(self, event):
         if self.mode == "edit":
+            # Remember which shape the drag started on: on release the cursor
+            # may be over a different (overlapping) shape, or outside the one
+            # that was resized, and that one must be the one committed.
+            self._edit_target = self._resolve_labeled_item(self.itemAt(event.pos()))
             super().mousePressEvent(event)
             return
         if self._pixmap_item and event.button() == Qt.LeftButton:
@@ -243,7 +323,7 @@ class AnnotationCanvas(QGraphicsView):
             return
 
         if self._rubber_band_item:
-            rect = self._rubber_band_item.rect()
+            rect = self._clamp_to_image(self._rubber_band_item.rect())
             self._scene.removeItem(self._rubber_band_item)
             self._rubber_band_item = None
 
@@ -270,18 +350,13 @@ class AnnotationCanvas(QGraphicsView):
             threshold = 95.0
 
         comp_id = str(uuid.uuid4())
-        if self.drawing_mode == "circle":
-            item = LabeledEllipseItem(rect, clean_name, self.line_width, self.font_size, COMPONENT_COLOR)
-        else:
-            item = LabeledRectItem(rect, clean_name, self.line_width, self.font_size, COMPONENT_COLOR)
-        item.setData(0, comp_id)
-        item.setData(1, "component")
-        self._scene.addItem(item)
-        self._items_by_id[comp_id] = item
+        x, y, w, h = int(rect.x()), int(rect.y()), int(rect.width()), int(rect.height())
+        self.add_component_item(comp_id, x, y, w, h, clean_name, self.drawing_mode,
+                                self.line_width, self.font_size)
 
         self.componentAdded.emit({
             "component_id": comp_id, "name": clean_name,
-            "x": int(rect.x()), "y": int(rect.y()), "w": int(rect.width()), "h": int(rect.height()),
+            "x": x, "y": y, "w": w, "h": h,
             "similarity_threshold": threshold, "shape": self.drawing_mode,
             "line_width": self.line_width, "font_size": self.font_size,
         })
@@ -296,26 +371,19 @@ class AnnotationCanvas(QGraphicsView):
             return
 
         region_id = str(uuid.uuid4())
-        label = f"CODE:{code_type}"
-        if self.drawing_mode == "circle":
-            item = LabeledEllipseItem(rect, label, self.line_width, 10, CODE_REGION_COLOR)
-        else:
-            item = LabeledRectItem(rect, label, self.line_width, 10, CODE_REGION_COLOR)
-        item.setData(0, region_id)
-        item.setData(1, "code_region")
-        self._scene.addItem(item)
-        self._items_by_id[region_id] = item
+        x, y, w, h = int(rect.x()), int(rect.y()), int(rect.width()), int(rect.height())
+        self.add_code_region_item(region_id, x, y, w, h, code_type, self.drawing_mode, self.line_width)
 
         self.codeRegionAdded.emit({
             "region_id": region_id, "code_type": code_type,
-            "x": int(rect.x()), "y": int(rect.y()), "w": int(rect.width()), "h": int(rect.height()),
+            "x": x, "y": y, "w": w, "h": h,
             "shape": self.drawing_mode, "line_width": self.line_width,
         })
 
     def _handle_edit_release(self, event):
-        item = self.itemAt(event.pos())
-        target = self._resolve_labeled_item(item)
-        if target is None:
+        target = self._edit_target or self._resolve_labeled_item(self.itemAt(event.pos()))
+        self._edit_target = None
+        if target is None or target.scene() is not self._scene:
             return
         item_id = target.data(0)
         item_type = target.data(1)
@@ -327,6 +395,7 @@ class AnnotationCanvas(QGraphicsView):
             target.rect().y() + target.pos().y(),
             target.rect().width(), target.rect().height()
         )
+        target.prepareGeometryChange()
         target.setRect(new_rect)
         target.setPos(0, 0)
         target._update_label_pos()

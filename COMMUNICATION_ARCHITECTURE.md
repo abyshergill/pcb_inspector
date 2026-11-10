@@ -29,7 +29,8 @@ That is the literal string `"TRIGGER\n"` — 8 bytes, UTF-8/ASCII encoded, newli
 ### 2.3 UDP vs TCP behavior
 
 * **UDP**: each interval tick sends one independent datagram via `sendto(host, port)`. No connection state; if the target isn't listening, the packet is silently dropped (fire-and-forget).
-* **TCP**: a single TCP connection is opened once (on Start), then every interval tick calls `sendall()` on that same connection. **The remote device must already be running a TCP server/listener on that port before you click Start**, or the connection attempt fails silently and no further sends occur until Start is pressed again.
+* **TCP**: a single TCP connection is opened once (on Start, with a 2-second connect timeout), then every interval tick calls `sendall()` on that same connection. **The remote device must already be running a TCP server/listener on that port before you click Start** — if it is not, an error dialog is shown and triggering does not start. If the connection drops later, the status label shows the failure and the app reconnects automatically (at most one attempt every 5 seconds).
+* In both modes a capture is only taken when the trigger packet was actually sent; a failed send is reported on the status label instead.
 
 ### 2.4 Timing diagram
 
@@ -72,7 +73,7 @@ but this exact text is not required — a PLC could send `"1"`, `"GO"`, `0xFF`, 
 ### 3.3 UDP vs TCP behavior
 
 * **UDP**: the listener calls `recvfrom()` in a loop — every datagram received (from any sender) fires a capture, indefinitely, with no connection setup needed. This is the simpler and generally recommended choice for Mode 2.
-* **TCP**: the listener calls `listen(1)` then `accept()` **once**, then reads from that single connection in a loop. **Important limitation**: only one TCP client connection is accepted for the lifetime of a single "Listen" session. If that client disconnects, the read loop ends and no further signals are processed until you click Stop and Listen again. If your PLC repeatedly opens/closes short-lived TCP connections per trigger, use UDP instead, or see Section 6 for a production hardening note.
+* **TCP**: the listener calls `listen()` and then `accept()` in a loop. Each client connection is read until it closes, then the listener goes back to `accept()` for the next one, for the whole "Listen" session. This works both for a PLC that keeps one persistent connection and for one that opens a new short-lived connection per trigger. Clients are served one at a time; each `recv()` chunk counts as one trigger.
 
 ### 3.4 Timing diagram
 
@@ -171,14 +172,14 @@ while True:
 * Both PCs/devices must be on the **same subnet or routed** to each other (`ping` should succeed between them first).
 * The configured port must be **allowed through the Windows Firewall** (or any OS firewall) on the machine running PCB Inspector, for **inbound** traffic when using Mode 2, and for **outbound** traffic when using Mode 1.
 * Only one process can bind to a given UDP/TCP port at a time — stop a previous Listen/Start session before starting another on the same port.
-* For **TCP** in Mode 2, remember the current implementation accepts a single persistent client per "Listen" session (see Section 3.3) — prefer UDP if your PLC will reconnect frequently per signal.
+* For **TCP** in Mode 2, clients are served one at a time (see Section 3.3); a second simultaneous connection waits until the first one closes.
 
 ## 7. Recommended Hardening for Full Production Deployment
 
 The current implementation intentionally keeps the wire protocol as simple as possible (a bare string) to minimize integration friction. If you move to a larger, multi-line production deployment, consider these upgrades (not yet implemented, flagged here for planning):
 
 * **Acknowledgment replies** — currently neither mode sends a response back to the sender confirming receipt; a PLC integrator may want a reply byte (e.g. `"ACK\n"`) to confirm the trigger was processed.
-* **Multi-client TCP accept loop** — so Mode 2's TCP listener can handle a PLC that opens a new short-lived connection per trigger, rather than one persistent connection.
+* **Concurrent TCP clients** — Mode 2 already accepts successive connections, but serves them one at a time; several PLCs holding persistent connections at once would need a thread per client.
 * **Structured payload (length-prefixed or JSON)** — to carry additional metadata per trigger (e.g. a station ID or expected serial number) instead of a bare fire-and-forget signal.
 * **Authentication/allow-listing** — the current listener accepts a trigger from any device that can reach the configured port; for a secured line, restrict by source IP or add a shared-secret token in the payload.
 

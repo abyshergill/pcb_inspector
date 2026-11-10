@@ -1,9 +1,8 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSpinBox, QFormLayout, QGroupBox
 )
-from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtCore import Signal, Qt
-import cv2
+from ui.inspection_widget import bgr_to_pixmap
 
 class LiveCaptureWidget(QWidget):
     """Dedicated tab for live camera preview plus manual and interval-based
@@ -28,6 +27,7 @@ class LiveCaptureWidget(QWidget):
         self.stop_preview_btn = QPushButton("Stop Live Preview")
         preview_btn_row.addWidget(self.start_preview_btn)
         preview_btn_row.addWidget(self.stop_preview_btn)
+        self.stop_preview_btn.setEnabled(False)
         self.start_preview_btn.clicked.connect(self.livePreviewStartRequested.emit)
         self.stop_preview_btn.clicked.connect(self.livePreviewStopRequested.emit)
 
@@ -50,6 +50,7 @@ class LiveCaptureWidget(QWidget):
         self.auto_stop_btn = QPushButton("Stop Auto Capture")
         auto_btn_row.addWidget(self.auto_start_btn)
         auto_btn_row.addWidget(self.auto_stop_btn)
+        self.auto_stop_btn.setEnabled(False)
         auto_layout.addLayout(auto_btn_row)
         self.auto_start_btn.clicked.connect(
             lambda: self.autoCaptureStartRequested.emit(self.auto_interval_spin.value())
@@ -66,10 +67,21 @@ class LiveCaptureWidget(QWidget):
         layout.addLayout(side_row)
 
     def set_preview_frame(self, frame_bgr) -> None:
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qimg).scaled(
-            self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        if frame_bgr is None:
+            return
+        pixmap = bgr_to_pixmap(frame_bgr).scaled(
+            self.preview_label.size(), Qt.KeepAspectRatio, Qt.FastTransformation
         )
         self.preview_label.setPixmap(pixmap)
+
+    def set_preview_running(self, running: bool) -> None:
+        self.start_preview_btn.setEnabled(not running)
+        self.stop_preview_btn.setEnabled(running)
+        if not running:
+            self.preview_label.clear()
+            self.preview_label.setText("No live preview")
+
+    def set_auto_capture_running(self, running: bool) -> None:
+        self.auto_start_btn.setEnabled(not running)
+        self.auto_stop_btn.setEnabled(running)
+        self.auto_interval_spin.setEnabled(not running)
